@@ -84,18 +84,54 @@ def extract_keywords(jd_text, top_n=20):
     keywords = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
     return [kw for kw, _ in keywords]
 
-def generate_suggestions(matched_keywords, missing_keywords):
+def generate_suggestions(ats_score, matched_keywords, missing_keywords, resume_text, jd_text):
     """
-    Generate suggestions based on matched and missing keywords.
+    Generate detailed suggestions for resume improvement based on ATS score, keywords, and content analysis.
     """
     suggestions = []
-    if missing_keywords:
-        suggestions.append(f"Add the following missing keywords to your resume: {', '.join(missing_keywords[:10])}")
-    if len(matched_keywords) < 5:
-        suggestions.append("Your resume matches few keywords. Consider tailoring it more to the job description.")
+
+    # Overall score-based suggestions
+    if ats_score < 30:
+        suggestions.append("Your resume has low compatibility. Consider a complete overhaul to better align with the job description.")
+    elif ats_score < 50:
+        suggestions.append("Your resume needs significant improvements. Focus on tailoring it specifically to this job.")
+    elif ats_score < 70:
+        suggestions.append("Your resume is moderately compatible. Minor adjustments can boost your score.")
     else:
-        suggestions.append("Good keyword match! Ensure your resume highlights these skills prominently.")
-    suggestions.append("Use action verbs and quantify achievements where possible.")
+        suggestions.append("Great job! Your resume is well-aligned. Fine-tune for even better results.")
+
+    # Keyword-based suggestions
+    if missing_keywords:
+        suggestions.append(f"Incorporate these missing keywords into your resume: {', '.join(missing_keywords[:10])}. Place them naturally in relevant sections like skills, experience, or summary.")
+    if len(matched_keywords) < 5:
+        suggestions.append("Your resume matches few keywords from the job description. Tailor your content more closely to the job requirements.")
+    else:
+        suggestions.append("Good keyword match! Ensure these skills are prominently featured in your resume.")
+
+    # Content-specific suggestions
+    resume_words = resume_text.split()
+    if len(resume_words) < 100:
+        suggestions.append("Your resume is quite short. Expand on your experiences, skills, and achievements to provide more detail.")
+    elif len(resume_words) > 600:
+        suggestions.append("Your resume is lengthy. Consider condensing it to 1-2 pages, focusing on the most relevant information.")
+
+    # General resume improvement tips
+    suggestions.append("Use action verbs (e.g., 'developed', 'managed', 'optimized') at the beginning of bullet points.")
+    suggestions.append("Quantify your achievements with numbers (e.g., 'Increased sales by 25%', 'Managed a team of 5').")
+    suggestions.append("Customize your resume for each job application by incorporating job-specific keywords.")
+    suggestions.append("Ensure your resume is ATS-friendly: use standard fonts, avoid tables/graphics, and save as PDF.")
+    suggestions.append("Include a professional summary at the top highlighting your key qualifications.")
+    suggestions.append("Proofread carefully for grammar and spelling errors.")
+
+    # Job-specific suggestions based on JD content
+    jd_lower = jd_text.lower()
+    if 'experience' in jd_lower and 'year' in jd_lower:
+        suggestions.append("Highlight your years of experience prominently in your resume.")
+    if 'degree' in jd_lower or 'bachelor' in jd_lower:
+        suggestions.append("Clearly list your educational qualifications and degrees.")
+    if 'certification' in jd_lower:
+        suggestions.append("Include relevant certifications if you have them, or consider obtaining them.")
+
     return suggestions
 
 # Streamlit UI
@@ -132,7 +168,7 @@ if st.button("Analyze Resume", type="primary"):
             missing_keywords = [kw for kw in jd_keywords if kw not in resume_words]
 
             # Suggestions
-            suggestions = generate_suggestions(matched_keywords, missing_keywords)
+            suggestions = generate_suggestions(ats_score, matched_keywords, missing_keywords, processed_resume, processed_jd)
 
         # Display results
         st.success("Analysis Complete!")
