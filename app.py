@@ -11,26 +11,43 @@ import pdfplumber
 from PyPDF2 import PdfReader
 from docx import Document
 import io
-
-# Download NLTK data if not present
+import os
+import sys
+import datetime
+from anthropic import Anthropic
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    import ollama
+except ImportError:
+    ollama = None
 
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
+# Initialize NLTK resources with caching
+@st.cache_resource
+def initialize_nltk_resources():
+    """
+    Download and initialize NLTK resources.
+    Cached to avoid redownloading on every app rerun.
+    """
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
 
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet')
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('stopwords')
+
+    try:
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        nltk.download('wordnet')
+    
+    lemmatizer = WordNetLemmatizer()
+    stop_words = set(stopwords.words('english'))
+    return lemmatizer, stop_words
 
 # Initialize lemmatizer and stopwords
-lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words('english'))
+lemmatizer, stop_words = initialize_nltk_resources()
 
 # Industry categories for analysis
 INDUSTRY_TEMPLATES = {
@@ -67,8 +84,30 @@ SKILL_CATEGORIES = {
     "databases": ["sql", "mysql", "postgresql", "mongodb", "oracle", "redis", "elasticsearch", "cassandra", "firebase"],
     "cloud_devops": ["aws", "azure", "gcp", "docker", "kubernetes", "jenkins", "terraform", "ansible", "ci/cd", "git", "jira"],
     "data_science": ["machine learning", "deep learning", "tensorflow", "pytorch", "scikit-learn", "pandas", "numpy", "spark", "tableau", "power bi", "nlp", "computer vision"],
-    "soft_skills": ["leadership", "communication", "teamwork", "problem solving", "analytical", "time management", "adaptability", "creativity", "conflict resolution"]
+    "soft_skills": [
+        "leadership", "communication", "teamwork", "problem solving", 
+        "analytical", "time management", "adaptability", "creativity", 
+        "conflict resolution", "collaboration", "coordination", "interpersonal",
+        "multitasking", "attention to detail", "critical thinking",
+        "decision making", "presentation", "negotiation", "mentoring"
+    ]
 }
+
+# Synonym mapping for soft skills - helps recognize related words in resumes
+SOFT_SKILL_SYNONYMS = {
+    "communication": ["communication", "communicated", "presented", "public speaking", "speaking"],
+    "teamwork": ["teamwork", "team", "collaborated", "cross-functional", "coordination", "cooperate", "cooperative"],
+    "leadership": ["leadership", "led", "leader", "managed", "mentored", "guided", "directing", "supervising"],
+    "problem solving": ["problem solving", "problem-solving", "troubleshoot", "troubleshooting", "resolved", "analytical", "solution-oriented"],
+    "adaptability": ["adaptability", "adaptive", "flexible", "flexibility", "dynamic", "versatile"],
+    "creative": ["creativity", "creative", "innovative", "innovation"],
+    "attention to detail": ["attention to detail", "detail-oriented", "meticulous", "thorough"],
+    "critical thinking": ["critical thinking", "think critically", "analytical thinking"],
+    "decision making": ["decision making", "decision-making", "decisive"],
+    "collaboration": ["collaboration", "collaborate", "collaborative", "team collaboration"],
+    "interpersonal": ["interpersonal", "interpersonal skills", "people skills", "soft skills"]
+}
+
 
 def extract_text(file):
     """
@@ -76,14 +115,16 @@ def extract_text(file):
     """
     text = ""
     if file.type == "application/pdf":
+        # Read file bytes once to avoid stream exhaustion
+        file_bytes = file.read()
         try:
             # Try pdfplumber first
-            with pdfplumber.open(io.BytesIO(file.read())) as pdf:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
                     text += page.extract_text() or ""
-        except:
+        except Exception as e:
             # Fallback to PyPDF2
-            reader = PdfReader(io.BytesIO(file.read()))
+            reader = PdfReader(io.BytesIO(file_bytes))
             for page in reader.pages:
                 text += page.extract_text()
     elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -92,9 +133,11 @@ def extract_text(file):
             text += para.text + "\n"
     return text
 
+@st.cache_data
 def preprocess_text(text):
     """
     Preprocess text: lowercase, remove special characters, stopwords, lemmatize.
+    Cached to avoid reprocessing the same text.
     """
     text = text.lower()
     text = re.sub(r'[^a-zA-Z\s]', '', text)
@@ -102,9 +145,11 @@ def preprocess_text(text):
     words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words]
     return ' '.join(words)
 
+@st.cache_data
 def calculate_similarity(resume_text, jd_text):
     """
     Calculate cosine similarity between resume and job description using TF-IDF.
+    Cached to avoid recalculating for the same text pairs.
     """
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform([resume_text, jd_text])
@@ -114,18 +159,87 @@ def calculate_similarity(resume_text, jd_text):
 def extract_keywords(jd_text, top_n=20):
     """
     Extract top keywords from job description using TF-IDF.
+    Supports both single words and multi-word phrases (bigrams).
     """
-    vectorizer = TfidfVectorizer(max_features=top_n, stop_words='english')
+    vectorizer = TfidfVectorizer(max_features=top_n, stop_words='english', ngram_range=(1, 2))
     tfidf_matrix = vectorizer.fit_transform([jd_text])
     feature_names = vectorizer.get_feature_names_out()
     scores = tfidf_matrix.toarray()[0]
     keywords = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
     return [kw for kw, _ in keywords]
 
+def skill_in_text(skill, text):
+    """
+    Check if a skill exists in text with intelligent matching.
+    Handles skill aliases (e.g., "javascript" matches "JS", "React" matches "React.js")
+    and prevents false positives from ambiguous short skills.
+    
+    Args:
+        skill: Skill name to search for
+        text: Text to search in
+        
+    Returns:
+        bool: True if skill found, False otherwise
+    """
+    text_lower = text.lower()
+    skill_lower = skill.lower()
+    
+    # Handle special skill aliases and blacklist entries
+    skill_aliases = {
+        "javascript": ["javascript", "js"],
+        "react": ["react", "react.js", "reactjs"],
+        "node.js": ["node.js", "nodejs", "node"],
+        "node": ["node.js", "nodejs", "node"],
+        "vue": ["vue", "vue.js", "vuejs"],
+        "vue.js": ["vue", "vue.js", "vuejs"],
+        "next.js": ["next.js", "nextjs"],
+        "next": ["next.js", "nextjs"],
+        "go": ["golang"],  # "go" alone is too ambiguous, only match "golang"
+        "r": [],  # remove "r" entirely - too ambiguous
+        "c++": ["c++", "cpp"],
+        "c#": ["c#", "csharp"],
+        "sql": ["sql", "mysql", "postgresql", "mssql"],
+    }
+    
+    # If skill has aliases defined, check those instead
+    if skill_lower in skill_aliases:
+        aliases = skill_aliases[skill_lower]
+        if not aliases:
+            return False  # blacklisted skills like "r"
+        return any(alias in text_lower for alias in aliases)
+    
+    # Default: word boundary match
+    pattern = r'\b' + re.escape(skill_lower) + r'\b'
+    return bool(re.search(pattern, text_lower, re.IGNORECASE))
+
+def soft_skill_in_text(skill, text):
+    """
+    Check if a soft skill exists in text, including synonyms.
+    
+    Args:
+        skill: Soft skill name
+        text: Text to search in (should be lowercased)
+        
+    Returns:
+        bool: True if skill or any of its synonyms are found
+    """
+    # First check exact match
+    if skill_in_text(skill, text):
+        return True
+    
+    # Then check synonyms if available
+    if skill in SOFT_SKILL_SYNONYMS:
+        for synonym in SOFT_SKILL_SYNONYMS[skill]:
+            if skill_in_text(synonym, text):
+                return True
+    
+    return False
+
 def analyze_skills(resume_text, jd_text):
     """
     Analyze and categorize skills from resume and job description.
     Returns categorized skills: technical, soft, and shows matched/missing skills.
+    Uses word-boundary matching and synonym detection for soft skills.
     """
     # Preprocess texts
     resume_lower = resume_text.lower()
@@ -137,17 +251,19 @@ def analyze_skills(resume_text, jd_text):
     
     for category, skills in SKILL_CATEGORIES.items():
         for skill in skills:
-            if skill in jd_lower:
+            if skill_in_text(skill, jd_lower):
                 if category == "soft_skills":
                     jd_soft.append(skill)
                 else:
                     jd_technical.append(skill)
     
-    # Find matched and missing skills
-    matched_technical = [s for s in jd_technical if s in resume_lower]
-    missing_technical = [s for s in jd_technical if s not in resume_lower]
-    matched_soft = [s for s in jd_soft if s in resume_lower]
-    missing_soft = [s for s in jd_soft if s not in resume_lower]
+    # Find matched and missing skills using word boundary matching for technical
+    matched_technical = [s for s in jd_technical if skill_in_text(s, resume_lower)]
+    missing_technical = [s for s in jd_technical if not skill_in_text(s, resume_lower)]
+    
+    # For soft skills, check exact match AND synonyms
+    matched_soft = [s for s in jd_soft if soft_skill_in_text(s, resume_lower)]
+    missing_soft = [s for s in jd_soft if not soft_skill_in_text(s, resume_lower)]
     
     return {
         "technical": {
@@ -162,9 +278,45 @@ def analyze_skills(resume_text, jd_text):
         }
     }
 
+def find_resume_sections(text):
+    """
+    Find resume sections regardless of casing or formatting.
+    Handles extra whitespace, newlines, ALL CAPS headers, and various section names.
+    
+    Args:
+        text: Resume text to analyze
+        
+    Returns:
+        list: Found section names (lowercased)
+    """
+    # Normalize whitespace to handle DOCX formatting and multi-line headers
+    text_lower = ' '.join(text.lower().split())
+    
+    # Map core sections to their common variations (including ALL CAPS variants)
+    section_keywords = {
+        "experience": ["experience", "work history", "employment history", 
+                       "professional experience", "internship", "work experience", "career history"],
+        "education": ["education", "academic background", "qualification", 
+                      "educational background", "degrees", "academic"],
+        "skills": ["skills", "technical skills", "core competencies", 
+                   "competencies", "expertise", "technologies", "technical expertise"],
+        "summary": ["summary", "professional summary", "objective", 
+                    "career objective", "profile", "about me", "professional profile"],
+        "certifications": ["certification", "certifications", "certificate", "licenses", "professional certification"],
+        "projects": ["project", "projects", "academic projects", "key projects", "project experience"]
+    }
+    
+    found = []
+    for section, keywords in section_keywords.items():
+        if any(kw in text_lower for kw in keywords):
+            found.append(section)
+    
+    return found
+
 def check_resume_format(resume_text, file_type):
     """
     Check resume formatting issues.
+    Uses robust section detection to handle various formatting and casing.
     """
     issues = []
     suggestions = []
@@ -178,16 +330,15 @@ def check_resume_format(resume_text, file_type):
         issues.append("Resume is too long")
         suggestions.append("Consider condensing to 1-2 pages, focusing on relevant information")
     
-    # Check for common sections
-    required_sections = ["experience", "education", "skills"]
-    found_sections = []
-    for section in required_sections:
-        if section in resume_text.lower():
-            found_sections.append(section)
+    # Check for common sections using robust detection
+    found_sections = find_resume_sections(resume_text)
+    core_sections = ["experience", "education", "skills"]
+    core_section_count = sum(1 for section in core_sections if section in found_sections)
     
-    if len(found_sections) < 2:
+    # Only flag as missing if NONE of the core sections are found
+    if core_section_count == 0:
         issues.append("Missing important sections")
-        suggestions.append("Ensure your resume has clear Experience, Education, and Skills sections")
+        suggestions.append("Ensure your resume has clear Experience, Education, and/or Skills sections")
     
     # Check for action verbs
     action_verbs = ["developed", "managed", "led", "created", "implemented", "designed", "analyzed", "increased", "reduced", "optimized"]
@@ -211,19 +362,99 @@ def check_resume_format(resume_text, file_type):
     return {
         "issues": issues,
         "suggestions": suggestions,
-        "word_count": word_count
+        "word_count": word_count,
+        "found_sections": found_sections
     }
+
+def calculate_experience_from_dates(text):
+    """
+    Calculate years of experience from date ranges found in text.
+    Handles regular hyphen (-), en-dash (–), and em-dash (—).
+    
+    Detects patterns like:
+    - "Aug 2025 – Present" / "Aug 2025 - Present"
+    - "Mar 2025 – May 2025"
+    - "2020 - Present" / "2020 – 2023"
+    
+    Returns:
+        tuple: (years, found_dates) where years is float or 0, found_dates is bool
+    """
+    month_map = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'june': 6,
+        'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+    
+    # Separator pattern: matches hyphen (-), en-dash (–), or em-dash (—)
+    sep = r'\s*[\-\u2013\u2014]\s*'
+    
+    # Date range patterns
+    patterns = [
+        # Month Year – Present (e.g., "Aug 2025 – Present")
+        r'([A-Za-z]{3,})\s+(\d{4})' + sep + r'(present|current|now)',
+        # Month Year – Month Year (e.g., "Mar 2025 – May 2025")
+        r'([A-Za-z]{3,})\s+(\d{4})' + sep + r'([A-Za-z]{3,})\s+(\d{4})',
+        # Year – Present (e.g., "2020 – Present")
+        r'(\d{4})' + sep + r'(present|current|now)',
+        # Year – Year (e.g., "2020 – 2023")
+        r'(\d{4})' + sep + r'(\d{4})',
+    ]
+    
+    today = datetime.date.today()
+    total_months = 0
+    
+    for pattern in patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            groups = match.groups()
+            try:
+                # Pattern: Month Year – Present
+                if len(groups) == 3 and groups[2].lower() in ['present', 'current', 'now']:
+                    month = month_map.get(groups[0].lower(), 1)
+                    year = int(groups[1])
+                    start = datetime.date(year, month, 1)
+                    months = (today.year - start.year) * 12 + (today.month - start.month)
+                    total_months += max(months, 0)
+                
+                # Pattern: Month Year – Month Year
+                elif len(groups) == 4:
+                    month1 = month_map.get(groups[0].lower(), 1)
+                    year1 = int(groups[1])
+                    month2 = month_map.get(groups[2].lower(), 1)
+                    year2 = int(groups[3])
+                    months = (year2 - year1) * 12 + (month2 - month1)
+                    total_months += max(months, 0)
+                
+                # Pattern: Year – Present or Year – Year
+                elif len(groups) == 2:
+                    if groups[1].lower() in ['present', 'current', 'now']:
+                        year = int(groups[0])
+                        months = (today.year - year) * 12 + today.month
+                        total_months += max(months, 0)
+                    else:
+                        months = (int(groups[1]) - int(groups[0])) * 12
+                        total_months += max(months, 0)
+            except (ValueError, IndexError):
+                continue
+    
+    if total_months > 0:
+        return round(total_months / 12, 1), True
+    else:
+        return 0, False
+
 
 def extract_experience_years(text):
     """
     Extract years of experience mentioned in the text.
+    First tries text patterns like "5 years experience", then falls back to date-based calculation.
     """
-    # Look for patterns like "X years", "X+ years", etc.
+    # Look for patterns like "X years", "X+ years", "5 yrs experience", etc.
     patterns = [
-        r'(\d+)\+?\s*years?\s+(?:of\s+)?experience',
         r'(\d+)\+?\s*years?\s+(?:of\s+)?experience',
         r'experience\s+(?:of\s+)?(\d+)\+?\s*years?',
         r'(\d+)\+?\s*year\s+(?:professional|work)',
+        r'(\d+)\+?\s*yrs?\s+(?:of\s+)?experience',
     ]
     
     years_found = []
@@ -231,15 +462,28 @@ def extract_experience_years(text):
         matches = re.findall(pattern, text.lower())
         years_found.extend([int(y) for y in matches])
     
-    return max(years_found) if years_found else None
+    if years_found:
+        return max(years_found), False  # Return (years, calculated_from_dates)
+    
+    # Fallback: try to calculate from date ranges
+    years_from_dates, found_dates = calculate_experience_from_dates(text)
+    if found_dates:
+        return years_from_dates, True
+    
+    return None, False
 
 def analyze_experience(resume_text, jd_text):
     """
     Compare years of experience required vs provided.
     """
     # Extract required years from JD
-    jd_years = extract_experience_years(jd_text)
-    resume_years = extract_experience_years(resume_text)
+    jd_result = extract_experience_years(jd_text)
+    jd_years = jd_result[0] if isinstance(jd_result, tuple) else jd_result
+    
+    # Extract resume years
+    resume_result = extract_experience_years(resume_text)
+    resume_years = resume_result[0] if isinstance(resume_result, tuple) else resume_result
+    resume_calculated = resume_result[1] if isinstance(resume_result, tuple) else False
     
     # Also check for experience mentions
     jd_experience_mentions = len(re.findall(r'experience', jd_text.lower()))
@@ -248,6 +492,7 @@ def analyze_experience(resume_text, jd_text):
     result = {
         "jd_required_years": jd_years,
         "resume_years": resume_years,
+        "resume_calculated_from_dates": resume_calculated,
         "meets_requirement": None,
         "analysis": []
     }
@@ -256,10 +501,16 @@ def analyze_experience(resume_text, jd_text):
         if resume_years:
             if resume_years >= jd_years:
                 result["meets_requirement"] = True
-                result["analysis"].append(f"You have {resume_years} years of experience, meeting the {jd_years}+ years requirement ✓")
+                if resume_calculated:
+                    result["analysis"].append(f"You have {resume_years} years of experience (calculated from work history), meeting the {jd_years}+ years requirement ✓")
+                else:
+                    result["analysis"].append(f"You have {resume_years} years of experience, meeting the {jd_years}+ years requirement ✓")
             else:
                 result["meets_requirement"] = False
-                result["analysis"].append(f"You have {resume_years} years of experience, but the job requires {jd_years}+ years")
+                if resume_calculated:
+                    result["analysis"].append(f"You have {resume_years} years of experience (calculated from work history), but the job requires {jd_years}+ years")
+                else:
+                    result["analysis"].append(f"You have {resume_years} years of experience, but the job requires {jd_years}+ years")
         else:
             result["analysis"].append("Could not determine years of experience from resume. Clearly list your work history with dates.")
     
@@ -268,32 +519,60 @@ def analyze_experience(resume_text, jd_text):
     
     return result
 
-def analyze_education(resume_text, jd_text):
+def detect_education_in_text(text):
     """
-    Check if education requirements are met.
+    Detect education levels in text using robust regex patterns.
+    Handles whitespace normalization for DOCX files and various degree formats.
+    
+    Args:
+        text: Text to search in (resume or job description)
+        
+    Returns:
+        list: List of tuples (education_level, importance_level)
+              e.g., [("bachelor", 3), ("master", 4)]
     """
-    # Education levels
+    # Normalize whitespace to handle DOCX formatting issues
+    text_clean = ' '.join(text.lower().split())
+    
+    # Education detection patterns
+    education_patterns = {
+        "phd": [r'\bph\.?d\b', r'\bdoctorate\b'],
+        "master": [r'\bmaster', r'\bm\.sc\b', r'\bmtech\b', r'\bm\.tech\b', r'\bme\b', r'\bpgd\b', r'\bpostgraduate\b', r'\bpost.graduate\b'],
+        "bachelor": [r'\bbachelor', r'\bb\.sc\b', r'\bbca\b', r'\bb\.tech\b', r'\bbtec\b', r'\bb\.e\b', r'\bbe\b', r'\bb\.com\b', r'\bbba\b'],
+        "associate": [r'\bassociate\b'],
+        "high school": [r'\bhigh school\b', r'\bhsc\b', r'\bssc\b', r'\b10\+2\b', r'\bclass 12\b'],
+        "mba": [r'\bmba\b']
+    }
+    
+    # Education level hierarchy
     education_levels = {
         "high school": 1,
         "associate": 2,
         "bachelor": 3,
         "master": 4,
-        "phd": 5,
-        "doctorate": 5,
-        "mba": 4
+        "mba": 4,
+        "phd": 5
     }
     
-    # Find required education in JD
-    jd_education = []
-    for edu, level in education_levels.items():
-        if edu in jd_text.lower():
-            jd_education.append((edu, level))
+    found = []
+    for edu, patterns in education_patterns.items():
+        for pattern in patterns:
+            if re.search(pattern, text_clean):
+                found.append((edu, education_levels[edu]))
+                break  # Don't add duplicate education levels
     
-    # Find education in resume
-    resume_education = []
-    for edu, level in education_levels.items():
-        if edu in resume_text.lower():
-            resume_education.append((edu, level))
+    return found
+
+def analyze_education(resume_text, jd_text):
+    """
+    Check if education requirements are met.
+    Uses robust pattern matching to handle various degree formats and whitespace issues.
+    """
+    # Find required education in JD using robust pattern matching
+    jd_education = detect_education_in_text(jd_text)
+    
+    # Find education in resume using robust pattern matching
+    resume_education = detect_education_in_text(resume_text)
     
     result = {
         "required": jd_education,
@@ -332,6 +611,62 @@ def detect_industry(jd_text):
     if max(scores.values()) > 0:
         return max(scores, key=scores.get)
     return "General"
+
+def extract_resume_sections(resume_text):
+    """
+    Extract resume section headers in various formats.
+    Detects:
+    - Title case headers: "Experience:", "Education:"
+    - ALL CAPS headers: "EXPERIENCE", "WORK HISTORY"
+    - Headers with or without colons
+    
+    Args:
+        resume_text: Raw resume text
+        
+    Returns:
+        list: Found section names (lowercased)
+    """
+    common_sections = [
+        "experience", "education", "skills", "summary", "objective",
+        "certifications", "projects", "awards", "work history",
+        "professional experience", "technical skills", "core competencies",
+        "qualifications", "achievements", "employment", "references",
+        "professional development", "languages"
+    ]
+    
+    found_sections = []
+    
+    # Create regex patterns for different formats
+    patterns = []
+    
+    # Pattern 1: Title Case with optional colon (e.g., "Experience:" or "Experience")
+    # Matches lines that start with capitalized words
+    patterns.append(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*:?\s*$')
+    
+    # Pattern 2: ALL CAPS headers (e.g., "EXPERIENCE" or "WORK HISTORY")
+    patterns.append(r'^([A-Z\s]{2,})\s*:?\s*$')
+    
+    lines = resume_text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Check against common section patterns
+        for pattern in patterns:
+            matches = re.findall(pattern, line)
+            if matches:
+                section_name = matches[0].strip().rstrip(':').lower()
+                
+                # Only add if it matches a common section name
+                for common in common_sections:
+                    if section_name == common or common in section_name or section_name in common:
+                        if common not in found_sections:
+                            found_sections.append(common)
+                        break
+    
+    return found_sections
 
 def get_industry_advice(industry, resume_sections):
     """
@@ -459,11 +794,170 @@ def generate_suggestions(ats_score, matched_keywords, missing_keywords, resume_t
 
     return suggestions
 
+def calculate_composite_ats_score(cosine_sim, matched_keywords, jd_keywords, format_analysis, resume_text):
+    """
+    Calculate a composite ATS score using multiple factors.
+    
+    Formula:
+    ats_score = (cosine_similarity * 0.35) + (keyword_match_percent * 0.35) + 
+                (format_score * 0.15) + (section_score * 0.15)
+    
+    Args:
+        cosine_sim: Cosine similarity score (0-100)
+        matched_keywords: List of matched keywords
+        jd_keywords: List of all keywords from job description
+        format_analysis: Dictionary with format issues
+        resume_text: Raw resume text
+    
+    Returns:
+        float: Composite ATS score (0-100)
+    """
+    # 1. Cosine Similarity (0-100) - weighted at 35%
+    similarity_component = cosine_sim * 0.35
+    
+    # 2. Keyword Match Percentage (0-100) - weighted at 35%
+    keyword_match_percent = (len(matched_keywords) / len(jd_keywords) * 100) if jd_keywords else 0
+    keyword_component = keyword_match_percent * 0.35
+    
+    # 3. Format Score (0-100) - weighted at 15%
+    format_score = 100
+    if format_analysis["issues"]:
+        # Subtract 20 points for each format issue, minimum 0
+        format_score = max(0, 100 - (len(format_analysis["issues"]) * 20))
+    format_component = format_score * 0.15
+    
+    # 4. Section Score (0-100) - weighted at 15%
+    required_sections = ["experience", "education", "skills", "summary"]
+    resume_lower = resume_text.lower()
+    found_sections = sum(1 for section in required_sections if section in resume_lower)
+    section_score = (found_sections / len(required_sections)) * 100 if required_sections else 0
+    section_component = section_score * 0.15
+    
+    # Calculate composite score
+    composite_score = similarity_component + keyword_component + format_component + section_component
+    
+    return min(100, max(0, composite_score))  # Ensure score is between 0-100
+
+def get_ai_suggestions(resume_text, jd_text, ats_score, missing_keywords, skills_analysis, api_key):
+    """
+    Get AI-powered suggestions using Anthropic API.
+    
+    Args:
+        resume_text: Raw resume text
+        jd_text: Job description text
+        ats_score: Current ATS score
+        missing_keywords: List of missing keywords
+        skills_analysis: Skills analysis dictionary
+        api_key: Anthropic API key
+        
+    Returns:
+        str: AI-generated suggestions or error message
+    """
+    try:
+        client = Anthropic(api_key=api_key)
+        
+        # Prepare the prompt
+        missing_technical_skills = ", ".join(skills_analysis.get('technical', {}).get('missing', [])[:10]) if skills_analysis.get('technical', {}).get('missing') else "None"
+        missing_keywords_str = ", ".join(missing_keywords[:10]) if missing_keywords else "None"
+        
+        prompt = f"""You are an expert ATS resume consultant. Analyze this resume against the job description and provide 5 specific, actionable improvements.
+
+ATS Score: {ats_score:.1f}%
+Missing Keywords: {missing_keywords_str}
+Missing Technical Skills: {missing_technical_skills}
+
+Resume (excerpt): {resume_text[:1500]}
+
+Job Description: {jd_text[:1500]}
+
+Provide exactly 5 numbered, specific, and practical suggestions. Be direct and focus on improving ATS compatibility and relevance to the job."""
+        
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        return response.content[0].text
+    
+    except Exception as e:
+        return f"Error getting AI suggestions: {str(e)}"
+
+def get_ai_suggestions_ollama(resume_text, jd_text, ats_score, missing_keywords, skills_analysis):
+    """
+    Get AI-powered suggestions using local Ollama (completely free, no API key).
+    Requires Ollama to be running locally.
+    
+    Args:
+        resume_text: Raw resume text
+        jd_text: Job description text
+        ats_score: Current ATS score
+        missing_keywords: List of missing keywords
+        skills_analysis: Skills analysis dictionary
+        
+    Returns:
+        str: AI-generated suggestions or error message
+    """
+    if ollama is None:
+        return "Ollama library not installed. Install with: pip install ollama"
+    
+    try:
+        missing_technical_skills = ", ".join(skills_analysis.get('technical', {}).get('missing', [])[:10]) if skills_analysis.get('technical', {}).get('missing') else "None"
+        missing_keywords_str = ", ".join(missing_keywords[:10]) if missing_keywords else "None"
+        
+        prompt = f"""You are an expert ATS resume consultant.
+
+ATS Score: {ats_score:.1f}%
+Missing Keywords: {missing_keywords_str}
+Missing Technical Skills: {missing_technical_skills}
+
+Resume (excerpt):
+{resume_text[:1500]}
+
+Job Description (excerpt):
+{jd_text[:1000]}
+
+Provide 5 numbered, specific, and practical improvement suggestions to improve ATS compatibility and match the job description better."""
+        
+        response = ollama.chat(
+            model='llama3.2',
+            messages=[{"role": "user", "content": prompt}],
+            stream=False
+        )
+        
+        return response['message']['content']
+    
+    except Exception as e:
+        return f"❌ Ollama not running. Start with: `ollama serve` in a terminal\nError: {str(e)}"
+
 # Streamlit UI
 st.set_page_config(page_title="AI Resume ATS Analyzer", page_icon="📄", layout="wide")
 
 st.title("AI Resume ATS Analyzer")
 st.markdown("Upload your resume and paste the job description to get a comprehensive ATS compatibility analysis.")
+
+# Sidebar for API key configuration
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = st.text_input(
+        "Anthropic API Key (for AI suggestions)",
+        type="password",
+        help="Your Anthropic API key to enable AI-powered suggestions. Get one at https://console.anthropic.com"
+    )
+    if api_key:
+        st.session_state.anthropic_api_key = api_key
+    
+    st.markdown("---")
+    st.markdown("**Features:**")
+    st.markdown("- 📊 Composite ATS Score")
+    st.markdown("- 🔧 Skills Analysis")
+    st.markdown("- 💼 Experience Matching")
+    st.markdown("- 🎓 Education Qualifier")
+    st.markdown("- 📋 Format Checker")
+    if st.session_state.get('anthropic_api_key'):
+        st.markdown("- 🤖 AI Suggestions")
 
 # Upload section with optional cover letter
 col1, col2 = st.columns(2)
@@ -480,62 +974,112 @@ industry = st.selectbox("Industry (Auto-detected from JD)",
 
 if st.button("Analyze Resume", type="primary"):
     if uploaded_file is not None and job_description.strip():
-        with st.spinner("Analyzing..."):
-            # Extract and preprocess
-            resume_text = extract_text(uploaded_file)
-            if not resume_text.strip():
-                st.error("Could not extract text from the resume. Please check the file.")
-                st.stop()
-            
-            # Process cover letter if provided
-            cover_letter_text = ""
-            if cover_letter_file:
-                cover_letter_text = extract_text(cover_letter_file)
-            
-            processed_resume = preprocess_text(resume_text)
-            processed_jd = preprocess_text(job_description)
+        # Check if we need to run analysis or use cached results from session_state
+        analysis_key = f"resume_analysis_{hash((uploaded_file.name, job_description, industry))}"
+        
+        if analysis_key not in st.session_state:
+            with st.spinner("Analyzing..."):
+                # Extract and preprocess
+                resume_text = extract_text(uploaded_file)
+                if not resume_text.strip():
+                    st.error("Could not extract text from the resume. Please check the file.")
+                    st.stop()
+                
+                # Process cover letter if provided
+                cover_letter_text = ""
+                if cover_letter_file:
+                    cover_letter_text = extract_text(cover_letter_file)
+                
+                processed_resume = preprocess_text(resume_text)
+                processed_jd = preprocess_text(job_description)
 
-            # Calculate ATS score
-            ats_score = calculate_similarity(processed_resume, processed_jd)
+                # Calculate raw cosine similarity
+                cosine_sim = calculate_similarity(processed_resume, processed_jd)
 
-            # Keyword analysis
-            jd_keywords = extract_keywords(processed_jd)
-            resume_words = set(processed_resume.split())
-            matched_keywords = [kw for kw in jd_keywords if kw in resume_words]
-            missing_keywords = [kw for kw in jd_keywords if kw not in resume_words]
+                # Keyword analysis (supports both single words and multi-word phrases)
+                jd_keywords = extract_keywords(processed_jd)
+                # For keywords, check if they exist as words or phrases in the resume
+                matched_keywords = [
+                    kw for kw in jd_keywords 
+                    if skill_in_text(kw, processed_resume)  # Use word boundary matching
+                ]
+                missing_keywords = [
+                    kw for kw in jd_keywords 
+                    if not skill_in_text(kw, processed_resume)
+                ]
 
-            # ====== NEW FEATURES ======
-            
-            # 1. Skills Analysis
-            skills_analysis = analyze_skills(resume_text, job_description)
-            
-            # 2. Resume Format Checker
-            format_analysis = check_resume_format(resume_text, uploaded_file.type)
-            
-            # 3. Experience Matching
-            experience_analysis = analyze_experience(resume_text, job_description)
-            
-            # 4. Education Qualifier
-            education_analysis = analyze_education(resume_text, job_description)
-            
-            # 7. Industry-Specific Templates
-            detected_industry = detect_industry(job_description)
-            if industry == "Auto-Detect":
-                selected_industry = detected_industry
-            else:
-                selected_industry = industry
-            
-            # Get resume sections for industry advice
-            resume_sections = re.findall(r'^[A-Z][a-z]+:', resume_text, re.MULTILINE)
-            industry_advice = get_industry_advice(selected_industry, resume_sections)
-            
-            # 8. Cover Letter Analysis
-            cover_letter_analysis = None
-            if cover_letter_text:
-                cover_letter_analysis = analyze_cover_letter(cover_letter_text, resume_text, job_description)
+                # 2. Resume Format Checker (needed for composite ATS score)
+                format_analysis = check_resume_format(resume_text, uploaded_file.type)
 
-            # Suggestions
-            suggestions = generate_suggestions(ats_score, matched_keywords, missing_keywords, processed_resume, processed_jd)
+                # Calculate composite ATS score
+                ats_score = calculate_composite_ats_score(cosine_sim, matched_keywords, jd_keywords, format_analysis, resume_text)
+
+                # ====== NEW FEATURES ======
+                
+                # 1. Skills Analysis
+                skills_analysis = analyze_skills(resume_text, job_description)
+                
+                # 3. Experience Matching
+                experience_analysis = analyze_experience(resume_text, job_description)
+                
+                # 4. Education Qualifier
+                education_analysis = analyze_education(resume_text, job_description)
+                
+                # 7. Industry-Specific Templates
+                detected_industry = detect_industry(job_description)
+                if industry == "Auto-Detect":
+                    selected_industry = detected_industry
+                else:
+                    selected_industry = industry
+                
+                # Get resume sections for industry advice
+                resume_sections = extract_resume_sections(resume_text)
+                industry_advice = get_industry_advice(selected_industry, resume_sections)
+                
+                # 8. Cover Letter Analysis
+                cover_letter_analysis = None
+                if cover_letter_text:
+                    cover_letter_analysis = analyze_cover_letter(cover_letter_text, resume_text, job_description)
+
+                # Suggestions
+                suggestions = generate_suggestions(ats_score, matched_keywords, missing_keywords, processed_resume, processed_jd)
+
+                # Store all results in session_state to persist across reruns
+                st.session_state[analysis_key] = {
+                    'ats_score': ats_score,
+                    'matched_keywords': matched_keywords,
+                    'missing_keywords': missing_keywords,
+                    'skills_analysis': skills_analysis,
+                    'format_analysis': format_analysis,
+                    'experience_analysis': experience_analysis,
+                    'education_analysis': education_analysis,
+                    'detected_industry': detected_industry,
+                    'selected_industry': selected_industry,
+                    'industry_advice': industry_advice,
+                    'cover_letter_analysis': cover_letter_analysis,
+                    'suggestions': suggestions,
+                    'jd_keywords': jd_keywords,
+                    'processed_resume': processed_resume,
+                    'processed_jd': processed_jd
+                }
+        
+        # Retrieve results from session_state
+        results = st.session_state[analysis_key]
+        ats_score = results['ats_score']
+        matched_keywords = results['matched_keywords']
+        missing_keywords = results['missing_keywords']
+        skills_analysis = results['skills_analysis']
+        format_analysis = results['format_analysis']
+        experience_analysis = results['experience_analysis']
+        education_analysis = results['education_analysis']
+        detected_industry = results['detected_industry']
+        selected_industry = results['selected_industry']
+        industry_advice = results['industry_advice']
+        cover_letter_analysis = results['cover_letter_analysis']
+        suggestions = results['suggestions']
+        jd_keywords = results['jd_keywords']
+        processed_resume = results['processed_resume']
+        processed_jd = results['processed_jd']
 
         # Display results
         st.success("Analysis Complete!")
@@ -544,9 +1088,26 @@ if st.button("Analyze Resume", type="primary"):
         if industry == "Auto-Detect":
             st.info(f"📊 Detected Industry: **{detected_industry}**")
 
-        # ATS Score
+        # ATS Score with color coding
         st.subheader("📈 ATS Score")
-        st.markdown(f"<h1 style='text-align: center; color: #4CAF50;'>{ats_score:.1f}%</h1>", unsafe_allow_html=True)
+        
+        # Determine color and label based on score
+        if ats_score < 40:
+            color = "#F44336"  # Red
+            label = "Needs Major Work"
+        elif ats_score < 70:
+            color = "#FF9800"  # Orange
+            label = "Needs Improvement"
+        elif ats_score < 85:
+            color = "#2196F3"  # Blue
+            label = "Good Match"
+        else:
+            color = "#4CAF50"  # Green
+            label = "Excellent Match"
+        
+        # Display score with color
+        st.markdown(f"<h1 style='text-align: center; color: {color};'>{ats_score:.1f}%</h1>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='text-align: center; color: {color};'>{label}</h3>", unsafe_allow_html=True)
         st.progress(ats_score / 100)
 
         # Score Breakdown
@@ -606,7 +1167,10 @@ if st.button("Analyze Resume", type="primary"):
         
         with col2:
             if experience_analysis["resume_years"]:
-                st.metric("Your Experience", f"{experience_analysis['resume_years']} years")
+                if experience_analysis.get("resume_calculated_from_dates"):
+                    st.metric("Your Experience", f"{experience_analysis['resume_years']} years (from dates)")
+                else:
+                    st.metric("Your Experience", f"{experience_analysis['resume_years']} years")
             else:
                 st.metric("Your Experience", "Not detected")
         
@@ -711,6 +1275,47 @@ if st.button("Analyze Resume", type="primary"):
         st.subheader("💡 Suggestions for Improvement")
         for suggestion in suggestions:
             st.write(f"- {suggestion}")
+
+        # ====== AI-Powered Suggestions ======
+        if st.session_state.get('anthropic_api_key'):
+            st.markdown("---")
+            st.subheader("🤖 AI-Powered Suggestions")
+            
+            with st.spinner("Generating AI suggestions..."):
+                ai_suggestions = get_ai_suggestions(
+                    resume_text, 
+                    job_description, 
+                    ats_score, 
+                    missing_keywords, 
+                    skills_analysis,
+                    st.session_state.get('anthropic_api_key')
+                )
+            
+            if "Error" in ai_suggestions:
+                st.error(ai_suggestions)
+            else:
+                st.markdown(ai_suggestions)
+
+        # ====== Local AI Suggestions (Ollama) ======
+        else:
+            st.markdown("---")
+            st.subheader("🤖 AI Suggestions (Local)")
+            st.info("💡 Use local AI (free, no API key needed). Make sure Ollama is running.")
+            
+            if st.button("Generate Suggestions with Local AI", key="ollama_suggestions"):
+                with st.spinner("Generating suggestions with local AI..."):
+                    ollama_suggestions = get_ai_suggestions_ollama(
+                        resume_text,
+                        job_description,
+                        ats_score,
+                        missing_keywords,
+                        skills_analysis
+                    )
+                
+                if "❌" in ollama_suggestions or "Error" in ollama_suggestions:
+                    st.error(ollama_suggestions)
+                else:
+                    st.markdown(ollama_suggestions)
 
         # Download Report
         report = f"""
