@@ -294,14 +294,16 @@ def find_resume_sections(text):
     
     # Map core sections to their common variations (including ALL CAPS variants)
     section_keywords = {
-        "experience": ["experience", "work history", "employment history", 
-                       "professional experience", "internship", "work experience", "career history"],
+        "experience": ["experience", "your experience", "work history", "employment history", 
+                       "professional experience", "internship", "work experience", "career history",
+                       "professional background", "work experience", "employment"],
         "education": ["education", "academic background", "qualification", 
                       "educational background", "degrees", "academic"],
-        "skills": ["skills", "technical skills", "core competencies", 
+        "skills": ["skills", "your skills", "technical skills", "core competencies", 
                    "competencies", "expertise", "technologies", "technical expertise"],
-        "summary": ["summary", "professional summary", "objective", 
-                    "career objective", "profile", "about me", "professional profile"],
+        "summary": ["summary", "your summary", "professional summary", "objective", 
+                    "career objective", "profile", "about me", "your profile", 
+                    "professional profile", "personal profile", "background"],
         "certifications": ["certification", "certifications", "certificate", "licenses", "professional certification"],
         "projects": ["project", "projects", "academic projects", "key projects", "project experience"]
     }
@@ -627,7 +629,10 @@ def extract_resume_sections(resume_text):
         list: Found section names (lowercased)
     """
     common_sections = [
-        "experience", "education", "skills", "summary", "objective",
+        "experience", "your experience", "work history", "employment history",
+        "professional experience", "internship", "work experience", "career history",
+        "professional background", "employment", "education", "skills", "your skills",
+        "technical skills", "summary", "your summary", "objective", "your profile",
         "certifications", "projects", "awards", "work history",
         "professional experience", "technical skills", "core competencies",
         "qualifications", "achievements", "employment", "references",
